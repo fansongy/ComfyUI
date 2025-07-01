@@ -1,3 +1,4 @@
+import math
 import comfy.samplers
 import comfy.sample
 from comfy.k_diffusion import sampling as k_diffusion_sampling
@@ -248,6 +249,55 @@ class SetFirstSigma:
         sigmas = sigmas.clone()
         sigmas[0] = sigma
         return (sigmas, )
+
+class ExtendIntermediateSigmas:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required":
+                    {"sigmas": ("SIGMAS", ),
+                     "steps": ("INT", {"default": 2, "min": 1, "max": 100}),
+                     "start_at_sigma": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 20000.0, "step": 0.01, "round": False}),
+                     "end_at_sigma": ("FLOAT", {"default": 12.0, "min":  0.0, "max": 20000.0, "step": 0.01, "round": False}),
+                     "spacing": (['linear', 'cosine', 'sine'],),
+                    }
+               }
+    RETURN_TYPES = ("SIGMAS",)
+    CATEGORY = "sampling/custom_sampling/sigmas"
+
+    FUNCTION = "extend"
+
+    def extend(self, sigmas: torch.Tensor, steps: int, start_at_sigma: float, end_at_sigma: float, spacing: str):
+        if start_at_sigma < 0:
+            start_at_sigma = float("inf")
+
+        interpolator = {
+            'linear': lambda x: x,
+            'cosine': lambda x: torch.sin(x*math.pi/2),
+            'sine':   lambda x: 1 - torch.cos(x*math.pi/2)
+        }[spacing]
+
+        # linear space for our interpolation function
+        x = torch.linspace(0, 1, steps + 1, device=sigmas.device)[1:-1]
+        computed_spacing = interpolator(x)
+
+        extended_sigmas = []
+        for i in range(len(sigmas) - 1):
+            sigma_current = sigmas[i]
+            sigma_next = sigmas[i+1]
+
+            extended_sigmas.append(sigma_current)
+
+            if end_at_sigma <= sigma_current <= start_at_sigma:
+                interpolated_steps = computed_spacing * (sigma_next - sigma_current) + sigma_current
+                extended_sigmas.extend(interpolated_steps.tolist())
+
+        # Add the last sigma value
+        if len(sigmas) > 0:
+            extended_sigmas.append(sigmas[-1])
+
+        extended_sigmas = torch.FloatTensor(extended_sigmas)
+
+        return (extended_sigmas,)
 
 class KSamplerSelect:
     @classmethod
@@ -559,8 +609,14 @@ class Guider_DualCFG(comfy.samplers.CFGGuider):
     def predict_noise(self, x, timestep, model_options={}, seed=None):
         negative_cond = self.conds.get("negative", None)
         middle_cond = self.conds.get("middle", None)
+        positive_cond = self.conds.get("positive", None)
+        if model_options.get("disable_cfg1_optimization", False) == False:
+            if math.isclose(self.cfg2, 1.0):
+                negative_cond = None
+                if math.isclose(self.cfg1, 1.0):
+                    middle_cond = None
 
-        out = comfy.samplers.calc_cond_batch(self.inner_model, [negative_cond, middle_cond, self.conds.get("positive", None)], x, timestep, model_options)
+        out = comfy.samplers.calc_cond_batch(self.inner_model, [negative_cond, middle_cond, positive_cond], x, timestep, model_options)
         return comfy.samplers.cfg_function(self.inner_model, out[1], out[0], self.cfg2, x, timestep, model_options=model_options, cond=middle_cond, uncond=negative_cond) + (out[2] - out[1]) * self.cfg1
 
 class DualCFGGuider:
@@ -735,6 +791,7 @@ NODE_CLASS_MAPPINGS = {
     "SplitSigmasDenoise": SplitSigmasDenoise,
     "FlipSigmas": FlipSigmas,
     "SetFirstSigma": SetFirstSigma,
+    "ExtendIntermediateSigmas": ExtendIntermediateSigmas,
 
     "CFGGuider": CFGGuider,
     "DualCFGGuider": DualCFGGuider,

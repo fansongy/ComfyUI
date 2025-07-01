@@ -10,12 +10,12 @@ from app.logger import setup_logger
 import itertools
 import utils.extra_config
 import logging
+import sys
 
 if __name__ == "__main__":
-    #NOTE: These do not do anything on core ComfyUI which should already have no communication with the internet, they are for custom nodes.
+    #NOTE: These do not do anything on core ComfyUI, they are for custom nodes.
     os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
     os.environ['DO_NOT_TRACK'] = '1'
-
 
 setup_logger(log_level=args.verbose, use_stdout=args.log_stdout)
 
@@ -55,6 +55,9 @@ def apply_custom_paths():
 
 
 def execute_prestartup_script():
+    if args.disable_all_custom_nodes and len(args.whitelist_custom_nodes) == 0:
+        return
+
     def execute_script(script_path):
         module_name = os.path.splitext(script_path)[0]
         try:
@@ -65,9 +68,6 @@ def execute_prestartup_script():
         except Exception as e:
             logging.error(f"Failed to execute startup-script: {script_path} / {e}")
         return False
-
-    if args.disable_all_custom_nodes:
-        return
 
     node_paths = folder_paths.get_folder_paths("custom_nodes")
     for custom_node_path in node_paths:
@@ -81,6 +81,9 @@ def execute_prestartup_script():
 
             script_path = os.path.join(module_path, "prestartup_script.py")
             if os.path.exists(script_path):
+                if args.disable_all_custom_nodes and possible_module not in args.whitelist_custom_nodes:
+                    logging.info(f"Prestartup Skipping {possible_module} due to disable_all_custom_nodes and whitelist_custom_nodes")
+                    continue
                 time_before = time.perf_counter()
                 success = execute_script(script_path)
                 node_prestartup_times.append((time.perf_counter() - time_before, module_path, success))
@@ -124,13 +127,6 @@ if __name__ == "__main__":
 
     import cuda_malloc
 
-if args.windows_standalone_build:
-    try:
-        from fix_torch import fix_pytorch_libomp
-        fix_pytorch_libomp()
-    except:
-        pass
-
 import comfy.utils
 
 import execution
@@ -139,8 +135,8 @@ from server import BinaryEventTypes
 import nodes
 import comfy.model_management
 import comfyui_version
-import app.frontend_management
-
+import app.logger
+import hook_breaker_ac10a0
 
 def cuda_malloc_warning():
     device = comfy.model_management.get_torch_device()
@@ -156,7 +152,13 @@ def cuda_malloc_warning():
 
 def prompt_worker(q, server_instance):
     current_time: float = 0.0
-    e = execution.PromptExecutor(server_instance, lru_size=args.cache_lru)
+    cache_type = execution.CacheType.CLASSIC
+    if args.cache_lru > 0:
+        cache_type = execution.CacheType.LRU
+    elif args.cache_none:
+        cache_type = execution.CacheType.DEPENDENCY_AWARE
+
+    e = execution.PromptExecutor(server_instance, cache_type=cache_type, cache_size=args.cache_lru)
     last_gc_collect = 0
     need_gc = False
     gc_collect_interval = 10.0
@@ -186,7 +188,13 @@ def prompt_worker(q, server_instance):
 
             current_time = time.perf_counter()
             execution_time = current_time - execution_start_time
-            logging.info("Prompt executed in {:.2f} seconds".format(execution_time))
+
+            # Log Time in a more readable way after 10 minutes
+            if execution_time > 600:
+                execution_time = time.strftime("%H:%M:%S", time.gmtime(execution_time))
+                logging.info(f"Prompt executed in {execution_time}")
+            else:
+                logging.info("Prompt executed in {:.2f} seconds".format(execution_time))
 
         flags = q.get_flags()
         free_memory = flags.get("free_memory", False)
@@ -208,6 +216,7 @@ def prompt_worker(q, server_instance):
                 comfy.model_management.soft_empty_cache()
                 last_gc_collect = current_time
                 need_gc = False
+                hook_breaker_ac10a0.restore_functions()
 
 
 async def run(server_instance, address='', port=8188, verbose=True, call_on_start=None):
@@ -237,6 +246,15 @@ def cleanup_temp():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def setup_database():
+    try:
+        from app.database.db import init_db, dependencies_available
+        if dependencies_available():
+            init_db()
+    except Exception as e:
+        logging.error(f"Failed to initialize database. Please ensure you have installed the latest requirements. If the error persists, please report this as in future the database will be required: {e}")
+
+
 def start_comfyui(asyncio_loop=None):
     """
     Starts the ComfyUI server using the provided asyncio event loop or creates a new one.
@@ -259,16 +277,21 @@ def start_comfyui(asyncio_loop=None):
         asyncio_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(asyncio_loop)
     prompt_server = server.PromptServer(asyncio_loop)
-    q = execution.PromptQueue(prompt_server)
 
-    nodes.init_extra_nodes(init_custom_nodes=not args.disable_all_custom_nodes)
+    hook_breaker_ac10a0.save_functions()
+    nodes.init_extra_nodes(
+        init_custom_nodes=(not args.disable_all_custom_nodes) or len(args.whitelist_custom_nodes) > 0,
+        init_api_nodes=not args.disable_api_nodes
+    )
+    hook_breaker_ac10a0.restore_functions()
 
     cuda_malloc_warning()
+    setup_database()
 
     prompt_server.add_routes()
     hijack_progress(prompt_server)
 
-    threading.Thread(target=prompt_worker, daemon=True, args=(q, prompt_server,)).start()
+    threading.Thread(target=prompt_worker, daemon=True, args=(prompt_server.prompt_queue, prompt_server,)).start()
 
     if args.quick_test_for_ci:
         exit(0)
@@ -293,28 +316,18 @@ def start_comfyui(asyncio_loop=None):
     return asyncio_loop, prompt_server, start_all
 
 
-def warn_frontend_version(frontend_version):
-    try:
-        required_frontend = (0,)
-        req_path = os.path.join(os.path.dirname(__file__), 'requirements.txt')
-        with open(req_path, 'r') as f:
-            required_frontend = tuple(map(int, f.readline().split('=')[-1].split('.')))
-        if frontend_version < required_frontend:
-            logging.warning("________________________________________________________________________\nWARNING WARNING WARNING WARNING WARNING\n\nInstalled frontend version {} is lower than the recommended version {}.\n\n{}\n________________________________________________________________________".format('.'.join(map(str, frontend_version)), '.'.join(map(str, required_frontend)), app.frontend_management.frontend_install_warning_message()))
-    except:
-        pass
-
-
 if __name__ == "__main__":
     # Running directly, just start ComfyUI.
+    logging.info("Python version: {}".format(sys.version))
     logging.info("ComfyUI version: {}".format(comfyui_version.__version__))
-    frontend_version = app.frontend_management.frontend_version
-    logging.info("ComfyUI frontend version: {}".format('.'.join(map(str, frontend_version))))
+
+    if sys.version_info.major == 3 and sys.version_info.minor < 10:
+        logging.warning("WARNING: You are using a python version older than 3.10, please upgrade to a newer one. 3.12 and above is recommended.")
 
     event_loop, _, start_all_func = start_comfyui()
     try:
         x = start_all_func()
-        warn_frontend_version(frontend_version)
+        app.logger.print_startup_warnings()
         event_loop.run_until_complete(x)
     except KeyboardInterrupt:
         logging.info("\nStopped server")

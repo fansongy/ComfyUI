@@ -17,23 +17,26 @@
 """
 
 from __future__ import annotations
-from typing import Optional, Callable
-import torch
+
+import collections
 import copy
 import inspect
 import logging
-import uuid
-import collections
 import math
+import uuid
+from typing import Callable, Optional
 
-import comfy.utils
+import torch
+
 import comfy.float
-import comfy.model_management
-import comfy.lora
 import comfy.hooks
+import comfy.lora
+import comfy.model_management
 import comfy.patcher_extension
-from comfy.patcher_extension import CallbacksMP, WrappersMP, PatcherInjection
+import comfy.utils
 from comfy.comfy_types import UnetWrapperFunction
+from comfy.patcher_extension import CallbacksMP, PatcherInjection, WrappersMP
+
 
 def string_to_seed(data):
     crc = 0xFFFFFFFF
@@ -747,6 +750,7 @@ class ModelPatcher:
 
     def partially_unload(self, device_to, memory_to_free=0):
         with self.use_ejected():
+            hooks_unpatched = False
             memory_freed = 0
             patch_counter = 0
             unload_list = self._load_list()
@@ -769,6 +773,10 @@ class ModelPatcher:
                             if not lowvram_possible:
                                 move_weight = False
                                 break
+
+                            if not hooks_unpatched:
+                                self.unpatch_hooks()
+                                hooks_unpatched = True
 
                             if bk.inplace_update:
                                 comfy.utils.copy_to_param(self.model, key, bk.weight)
